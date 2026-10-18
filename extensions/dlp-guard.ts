@@ -18,6 +18,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export interface DlpGuardConfig {
   protectedPaths: string[];
+  integrityPaths: string[];
   enableGitleaks: boolean;
   gitleaksMinBytes: number;
   gitleaksTimeoutMs: number;
@@ -35,10 +36,21 @@ export const DEFAULT_CONFIG: DlpGuardConfig = {
     "~/.gnupg",
     "~/.gnupg/**",
     "~/.netrc",
+    "~/.zshrc*",
+    "~/.bashrc*",
+    "~/.bash_profile",
+    "~/.profile",
+    "**/*rc.local",
     "**/*.pem",
     "**/*.key",
     "**/id_rsa*",
     "**/id_ed25519*",
+    "~/.pi/agent/auth.json",
+  ],
+  integrityPaths: [
+    "~/.pi/agent/**",
+    "**/pi-dlp-guard/**",
+    "**/pi-ci-warden/**",
   ],
   enableGitleaks: true,
   gitleaksMinBytes: 4096,
@@ -54,6 +66,7 @@ export function loadConfig(): DlpGuardConfig {
       const parsed = JSON.parse(raw);
       return {
         protectedPaths: Array.isArray(parsed.protectedPaths) ? parsed.protectedPaths : DEFAULT_CONFIG.protectedPaths,
+        integrityPaths: Array.isArray(parsed.integrityPaths) ? parsed.integrityPaths : DEFAULT_CONFIG.integrityPaths,
         enableGitleaks: typeof parsed.enableGitleaks === "boolean" ? parsed.enableGitleaks : DEFAULT_CONFIG.enableGitleaks,
         gitleaksMinBytes: typeof parsed.gitleaksMinBytes === "number" ? parsed.gitleaksMinBytes : DEFAULT_CONFIG.gitleaksMinBytes,
         gitleaksTimeoutMs: typeof parsed.gitleaksTimeoutMs === "number" ? parsed.gitleaksTimeoutMs : DEFAULT_CONFIG.gitleaksTimeoutMs,
@@ -226,10 +239,32 @@ const INTRINSIC_PROTECTED_PATTERNS = [
   /(?:^|[\/\\])id_(?:rsa|ed25519)(?:[\.\-_].*)?$/i,
 ];
 
+function matchGlob(pattern: string, target: string): boolean {
+  const normTarget = target.replace(/\\/g, "/");
+  const normPattern = expandTilde(pattern).replace(/\\/g, "/");
+
+  if (normPattern.includes("*")) {
+    const regexPattern = normPattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "___GLOBSTAR___")
+      .replace(/\*/g, "[^/]*")
+      .replace(/___GLOBSTAR___/g, ".*");
+    const rx = new RegExp(`^${regexPattern}$`, "i");
+    if (rx.test(normTarget)) return true;
+
+    if (!pattern.includes("/")) {
+      const baseRx = new RegExp(`^${normPattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`, "i");
+      if (baseRx.test(normTarget.split("/").pop() || "")) return true;
+    }
+  }
+  return normTarget === normPattern || normTarget.startsWith(normPattern + "/");
+}
+
 export function isPathProtected(
   targetPath: string,
   config: DlpGuardConfig = DEFAULT_CONFIG,
-  cwd: string = process.cwd()
+  cwd: string = process.cwd(),
+  op: "read" | "write" = "read"
 ): { protected: boolean; reason?: string } {
   if (!targetPath || typeof targetPath !== "string") {
     return { protected: false };
@@ -249,14 +284,39 @@ export function isPathProtected(
     }
   }
 
-  // Check against configured protected paths
+  // Check against integrity paths if operation is mutating (write/edit/delete)
+  if (op === "write" && Array.isArray(config.integrityPaths)) {
+    for (const integrityPath of config.integrityPaths) {
+      const intExpanded = expandTilde(integrityPath.replace(/\\/g, "/"));
+      const intResolved = path.resolve(cwd, intExpanded);
+
+      if (
+        resolved === intResolved ||
+        resolved.startsWith(intResolved + path.sep) ||
+        matchGlob(integrityPath, resolved) ||
+        matchGlob(integrityPath, rawNormalized)
+      ) {
+        return {
+          protected: true,
+          reason: `Integrità del Guardiano: mutazione o cancellazione bloccata su "${integrityPath}" (Regola: Controllore != Controllato)`,
+        };
+      }
+    }
+  }
+
+  // Check against configured protected paths (blocked for both read and write)
   const homeDir = os.homedir();
   for (const configured of config.protectedPaths) {
     const cfgExpanded = expandTilde(configured.replace(/\\/g, "/"));
     const cfgResolved = path.resolve(cwd, cfgExpanded);
 
-    // Exact or prefix match
-    if (resolved === cfgResolved || resolved.startsWith(cfgResolved + path.sep)) {
+    // Exact, prefix, or glob match
+    if (
+      resolved === cfgResolved ||
+      resolved.startsWith(cfgResolved + path.sep) ||
+      matchGlob(configured, resolved) ||
+      matchGlob(configured, rawNormalized)
+    ) {
       return {
         protected: true,
         reason: `Percorso protetto configurato in dlp-guard.json: "${configured}"`,
@@ -294,6 +354,18 @@ export function isPathProtected(
           reason: `Risoluzione symlink/canonica punta a un percorso protetto (${canonical})`,
         };
       }
+
+      // Check integrity on canonical path for write ops
+      if (op === "write" && Array.isArray(config.integrityPaths)) {
+        for (const integrityPath of config.integrityPaths) {
+          if (matchGlob(integrityPath, canonicalNorm)) {
+            return {
+              protected: true,
+              reason: `Risoluzione symlink/canonica punta a percorso di integrità protetto (${canonical})`,
+            };
+          }
+        }
+      }
     }
   } catch {
     // If realpath resolution fails, lexical check already guarded the operation
@@ -318,11 +390,13 @@ export function checkBashCommand(
   const trimmed = cmd.trim();
 
   // 1. Redirection inspection: < file, > file, >> file, | tee file
-  const redirectionRegex = /(?:<|>|>>|\|\s*tee\s+(?:-a\s+)?)\s*([^\s;&|]+)/g;
+  const redirectionRegex = /(<|>|>>|\|\s*tee\s+(?:-a\s+)?)\s*([^\s;&|]+)/g;
   let match: RegExpExecArray | null;
   while ((match = redirectionRegex.exec(trimmed)) !== null) {
-    const rawTarget = match[1].replace(/["']/g, "");
-    const check = isPathProtected(rawTarget, config, cwd);
+    const operator = match[1].trim();
+    const rawTarget = match[2].replace(/["']/g, "");
+    const op = operator === "<" ? "read" : "write";
+    const check = isPathProtected(rawTarget, config, cwd, op);
     if (check.protected) {
       return {
         block: true,
@@ -332,29 +406,20 @@ export function checkBashCommand(
   }
 
   // 2. Token / Argument inspection: split on whitespace ignoring quoted regions
+  const isMutatingCommand = /^(?:rm|mv|sed\s+.*-i|truncate|dd|touch)\b/i.test(trimmed);
+  const defaultOp = isMutatingCommand ? "write" : "read";
   const tokens = trimmed.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
   for (const token of tokens) {
     const cleanToken = token.replace(/^["']|["']$/g, "");
     if (!cleanToken || cleanToken.startsWith("-")) continue;
 
-    // Check if token resolves to a protected file
-    if (
-      cleanToken.includes(".env") ||
-      cleanToken.includes(".ssh") ||
-      cleanToken.includes(".aws") ||
-      cleanToken.includes(".git") ||
-      cleanToken.endsWith(".pem") ||
-      cleanToken.endsWith(".key") ||
-      cleanToken.includes("id_rsa") ||
-      cleanToken.includes("id_ed25519")
-    ) {
-      const check = isPathProtected(cleanToken, config, cwd);
-      if (check.protected) {
-        return {
-          block: true,
-          reason: `Comando shell bloccato: argomento "${cleanToken}" punta a percorso protetto (${check.reason})`,
-        };
-      }
+    // Direct check against all protected patterns
+    const check = isPathProtected(cleanToken, config, cwd, defaultOp);
+    if (check.protected) {
+      return {
+        block: true,
+        reason: `Comando shell bloccato: argomento "${cleanToken}" punta a percorso protetto (${check.reason})`,
+      };
     }
   }
 
@@ -418,7 +483,8 @@ export default function (pi: ExtensionAPI) {
     // Intercept File Operations (read, write, edit)
     if (toolName === "read" || toolName === "write" || toolName === "edit") {
       const targetPath = String(input.path || input.file || "");
-      const check = isPathProtected(targetPath, config, process.cwd());
+      const op = toolName === "read" ? "read" : "write";
+      const check = isPathProtected(targetPath, config, process.cwd(), op);
       if (check.protected) {
         if (ctx.hasUI) {
           ctx.ui.notify(`🛑 [DLP Guard] Bloccato accesso al percorso: ${targetPath}`, "error");

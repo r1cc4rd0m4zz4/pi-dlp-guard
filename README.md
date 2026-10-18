@@ -40,6 +40,7 @@ Gli agenti di coding autonomi operano con ampi permessi di shell e manipolazione
   * *Horizon 1 (Transcript/Locale)*: Sanitizzazione immediata su `tool_result` prima che il testo tocchi il disco (`sessions/*.jsonl`) o il terminale.
   * *Horizon 2 (Wire/Provider)*: Filtraggio crittografico su `context` prima che qualsiasi frame lasci la macchina verso le API degli LLM.
 * ✅ **Preservazione Relazionale Semantica ($A == A$)**: Se lo stesso segreto compare più volte, riceve lo stesso token effimero di sessione (es. `[REDACTED_AWS_KEY_#1]`). Il modello comprende le relazioni strutturali senza conoscere i valori in chiaro.
+* ✅ **Integrità del Guardiano & Anti-Tampering (Controllore != Controllato)**: Protegge `~/.pi/agent/**`, la configurazione di sicurezza e il codice stesso di `pi-dlp-guard` contro modifiche, sovrascritture o cancellazioni (`rm`, `sed -i`, `write`, `edit`) tentate dall'agente o da prompt injection, garantendo che la sandbox non possa essere disarmata.
 * ✅ **Dual-Layer Path Guard**: Regex lessicale immediata + risoluzione canonica reale (`fs.realpathSync`) per neutralizzare traversal (`../../`), link simbolici e link fisici.
 * ✅ **Bash Lexer & Redirection Guard**: Ispezione degli argomenti e delle redirezioni shell (`<`, `>`, `>>`, `| tee`) bloccando l'accesso prima dello spawn.
 * ✅ **Dual-Core Engine**: Motore regex nativo in-process ultrarapido (<0.05ms) + integrazione pipe opzionale con `gitleaks` per diff pre-commit e buffer grandi (>4KB).
@@ -57,6 +58,7 @@ Gli agenti di coding autonomi operano con ampi permessi di shell e manipolazione
        ┌─────────────────────────────────────────────────────────┐
        │                LAYER 1: TOOL CALL GUARD                 │
        │  • Block read/write/edit on .env, ~/.ssh, ~/.aws, .git  │
+       │  • Anti-Tampering: protect ~/.pi/agent & guard code     │
        │  • Block bash redirection (<, >, >>) and sensitive args │
        │  • Canonical realpath check (anti-symlink/traversal)    │
        └────────────────────────────┬────────────────────────────┘
@@ -109,10 +111,21 @@ Il file viene auto-generato con i default raccomandati al primo avvio ed è comp
     "~/.gnupg",
     "~/.gnupg/**",
     "~/.netrc",
+    "~/.zshrc*",
+    "~/.bashrc*",
+    "~/.bash_profile",
+    "~/.profile",
+    "**/*rc.local",
     "**/*.pem",
     "**/*.key",
     "**/id_rsa*",
-    "**/id_ed25519*"
+    "**/id_ed25519*",
+    "~/.pi/agent/auth.json"
+  ],
+  "integrityPaths": [
+    "~/.pi/agent/**",
+    "**/pi-dlp-guard/**",
+    "**/pi-ci-warden/**"
   ],
   "enableGitleaks": true,
   "gitleaksMinBytes": 4096,
@@ -124,7 +137,7 @@ Il file viene auto-generato con i default raccomandati al primo avvio ed è comp
 
 ## Verifica e Test (`npm test`)
 
-La suite di regressione deterministica copre **19/19 asserzioni** sui rami negativi ed edge case:
+La suite di regressione deterministica copre **21/21 asserzioni** sui rami negativi ed edge case:
 
 ```bash
 npm test
@@ -137,6 +150,7 @@ npm test
   ✅ [PASS] Critical credentials & key paths
   ✅ [PASS] Symlink resolution to protected file (Mitnick Vector)
   ✅ [PASS] Normal benign files flow freely (Negative branch)
+  ✅ [PASS] Guardian Integrity Protection (Anti-Tampering)
 
 --- Group 2: Bash Shell Guard ---
   ✅ [PASS] Direct shell reading of .env
@@ -144,6 +158,7 @@ npm test
   ✅ [PASS] Shell output redirection (> and >>)
   ✅ [PASS] Pipe to tee redirection (| tee)
   ✅ [PASS] Shell operations on SSH / AWS keys
+  ✅ [PASS] Shell mutation blocking on Integrity paths
   ✅ [PASS] Benign shell commands pass through
 
 --- Group 3: DLP Redaction & Relational Preservation ---

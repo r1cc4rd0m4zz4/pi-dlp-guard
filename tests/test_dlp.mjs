@@ -61,6 +61,7 @@ test("Critical credentials & key paths", () => {
   assert.equal(isPathProtected(".git/config").protected, true);
   assert.equal(isPathProtected("certs/server.pem").protected, true);
   assert.equal(isPathProtected("keys/private.key").protected, true);
+  assert.equal(isPathProtected("~/.zshrc.local").protected, true);
 });
 
 test("Symlink resolution to protected file (Mitnick Vector)", () => {
@@ -83,6 +84,19 @@ test("Normal benign files flow freely (Negative branch)", () => {
   assert.equal(isPathProtected("package.json").protected, false);
   assert.equal(isPathProtected("README.md").protected, false);
   assert.equal(isPathProtected("tests/unit.test.js").protected, false);
+});
+
+test("Guardian Integrity Protection (Anti-Tampering)", () => {
+  // Read allowed for settings.json
+  assert.equal(isPathProtected("~/.pi/agent/settings.json", DEFAULT_CONFIG, process.cwd(), "read").protected, false);
+  // Write blocked for settings.json and dlp-guard.json
+  assert.equal(isPathProtected("~/.pi/agent/settings.json", DEFAULT_CONFIG, process.cwd(), "write").protected, true);
+  assert.equal(isPathProtected("~/.pi/agent/dlp-guard.json", DEFAULT_CONFIG, process.cwd(), "write").protected, true);
+  // Write blocked for guardian extension itself
+  assert.equal(isPathProtected("gitapp/pi-dlp-guard/extensions/dlp-guard.ts", DEFAULT_CONFIG, process.cwd(), "write").protected, true);
+  // Confidential auth.json blocked for both read and write
+  assert.equal(isPathProtected("~/.pi/agent/auth.json", DEFAULT_CONFIG, process.cwd(), "read").protected, true);
+  assert.equal(isPathProtected("~/.pi/agent/auth.json", DEFAULT_CONFIG, process.cwd(), "write").protected, true);
 });
 
 // =============================================================================
@@ -114,6 +128,15 @@ test("Pipe to tee redirection (| tee)", () => {
 test("Shell operations on SSH / AWS keys", () => {
   assert.equal(checkBashCommand("cp ~/.ssh/id_rsa /tmp/leak").block, true);
   assert.equal(checkBashCommand("tar -czf aws.tar ~/.aws").block, true);
+});
+
+test("Shell mutation blocking on Integrity paths", () => {
+  // Deletion blocked
+  assert.equal(checkBashCommand("rm -rf ~/.pi/agent").block, true);
+  // Redirection write blocked
+  assert.equal(checkBashCommand("echo evil > ~/.pi/agent/settings.json").block, true);
+  // Passive read allowed
+  assert.equal(checkBashCommand("cat ~/.pi/agent/settings.json").block, false);
 });
 
 test("Benign shell commands pass through", () => {
