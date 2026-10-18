@@ -1,0 +1,29 @@
+{
+  "name": "pi-dlp-guard",
+  "version": "0.1.0",
+  "description": "Zero-dependency DLP, Path Protection & Secret Redaction Guard for Pi Coding Agent",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "dlp",
+    "security",
+    "redaction",
+    "path-protection"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types tests/test_dlp.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/dlp-guard.ts"
+    ]
+  },
+  "files": [
+    "extensions/dlp-guard.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
