@@ -1,23 +1,25 @@
 /**
- * pi-dlp-guard: Zero-dependency DLP, Path Protection & Secret Redaction Guard
+ * pi-dlp-guard: path protection and secret redaction for Pi.
  *
- * Architecture:
- * 1. Path Guard: Dual-layer lexical + canonical realpath (anti-traversal & anti-symlinks).
- * 2. Bash Tool Guard: Lexer scanning arguments and shell redirections (<, >, >>).
- * 3. Hawking Black Hole Redaction: Deterministic, irreversible redaction with relational
- *    preservation ([REDACTED_<CATEGORY>_#<ID>]) on tool_result and wire context.
- * 4. Dual-Core Engine: Ultra-fast in-process regex (<0.05ms) + optional gitleaks via pipe
- *    for pre-commit staged diffs and large buffers.
+ * - tool_call:   blocks access to protected paths (structured tools + bash writes)
+ * - tool_result: redacts secrets from tool output before it enters the transcript
+ * - context:     redacts secrets from the messages sent to the model provider
+ *
+ * This is defense in depth, not a sandbox: bash is analysed lexically and cannot
+ * be made airtight. Use an OS-level sandbox as the real boundary.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as cp from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export interface DlpGuardConfig {
+  /** Blocked for read and write. */
   protectedPaths: string[];
+  /** Blocked for write only (the agent may still read them). */
   integrityPaths: string[];
   enableGitleaks: boolean;
   gitleaksMinBytes: number;
@@ -26,14 +28,11 @@ export interface DlpGuardConfig {
 
 export const DEFAULT_CONFIG: DlpGuardConfig = {
   protectedPaths: [
-    ".env*",
-    ".git",
+    ".env",
+    ".env.*",
     "**/.git/**",
-    "~/.ssh",
     "~/.ssh/**",
-    "~/.aws",
     "~/.aws/**",
-    "~/.gnupg",
     "~/.gnupg/**",
     "~/.netrc",
     "~/.zshrc*",
@@ -47,45 +46,50 @@ export const DEFAULT_CONFIG: DlpGuardConfig = {
     "**/id_ed25519*",
     "~/.pi/agent/auth.json",
   ],
-  integrityPaths: [
-    "~/.pi/agent/**",
-    "**/pi-dlp-guard/**",
-    "**/pi-ci-warden/**",
-  ],
+  integrityPaths: ["~/.pi/agent/**"],
   enableGitleaks: true,
   gitleaksMinBytes: 4096,
   gitleaksTimeoutMs: 500,
 };
 
-const CONFIG_FILE_PATH = path.join(os.homedir(), ".pi", "agent", "dlp-guard.json");
+const HOME = (() => {
+  try {
+    return fs.realpathSync(os.homedir());
+  } catch {
+    return os.homedir();
+  }
+})();
+const CONFIG_FILE = path.join(HOME, ".pi", "agent", "dlp-guard.json");
+const TEMPLATE_ENV = /^\.env\.(?:example|sample|template)$/i;
+
+let packageDir = "";
+try {
+  packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+} catch {
+  // Unknown location: only the configured integrityPaths apply.
+}
 
 export function loadConfig(): DlpGuardConfig {
   try {
-    if (fs.existsSync(CONFIG_FILE_PATH)) {
-      const raw = fs.readFileSync(CONFIG_FILE_PATH, "utf-8");
-      const parsed = JSON.parse(raw);
-      return {
-        protectedPaths: Array.isArray(parsed.protectedPaths) ? parsed.protectedPaths : DEFAULT_CONFIG.protectedPaths,
-        integrityPaths: Array.isArray(parsed.integrityPaths) ? parsed.integrityPaths : DEFAULT_CONFIG.integrityPaths,
-        enableGitleaks: typeof parsed.enableGitleaks === "boolean" ? parsed.enableGitleaks : DEFAULT_CONFIG.enableGitleaks,
-        gitleaksMinBytes: typeof parsed.gitleaksMinBytes === "number" ? parsed.gitleaksMinBytes : DEFAULT_CONFIG.gitleaksMinBytes,
-        gitleaksTimeoutMs: typeof parsed.gitleaksTimeoutMs === "number" ? parsed.gitleaksTimeoutMs : DEFAULT_CONFIG.gitleaksTimeoutMs,
-      };
-    }
-    // Auto-create default configuration file if absent
-    fs.mkdirSync(path.dirname(CONFIG_FILE_PATH), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2), { mode: 0o600 });
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    const list = (v: unknown, d: string[]) => (Array.isArray(v) && v.every((s) => typeof s === "string") ? (v as string[]) : d);
+    const num = (v: unknown, d: number) => (typeof v === "number" && v >= 0 ? v : d);
+    return {
+      protectedPaths: list(parsed.protectedPaths, DEFAULT_CONFIG.protectedPaths),
+      integrityPaths: list(parsed.integrityPaths, DEFAULT_CONFIG.integrityPaths),
+      enableGitleaks: typeof parsed.enableGitleaks === "boolean" ? parsed.enableGitleaks : DEFAULT_CONFIG.enableGitleaks,
+      gitleaksMinBytes: num(parsed.gitleaksMinBytes, DEFAULT_CONFIG.gitleaksMinBytes),
+      gitleaksTimeoutMs: num(parsed.gitleaksTimeoutMs, DEFAULT_CONFIG.gitleaksTimeoutMs),
+    };
   } catch {
-    // Non-blocking fallback to defaults
+    return { ...DEFAULT_CONFIG };
   }
-  return { ...DEFAULT_CONFIG };
 }
 
 // -----------------------------------------------------------------------------
-// Hawking Relational Redaction Engine
+// Secret redaction
 // -----------------------------------------------------------------------------
 
-// Session maps for relational preservation (A == A)
 const secretToToken = new Map<string, string>();
 const categoryCounters = new Map<string, number>();
 
@@ -94,522 +98,351 @@ export function resetSessionState(): void {
   categoryCounters.clear();
 }
 
-function getRelationalToken(secret: string, category: string): string {
-  const existing = secretToToken.get(secret);
-  if (existing) {
-    return existing;
+/** The same secret always maps to the same token within a session. */
+function tokenFor(secret: string, category: string): string {
+  let token = secretToToken.get(secret);
+  if (!token) {
+    const n = (categoryCounters.get(category) ?? 0) + 1;
+    categoryCounters.set(category, n);
+    token = `[REDACTED_${category}_#${n}]`;
+    secretToToken.set(secret, token);
   }
-  const currentCount = (categoryCounters.get(category) || 0) + 1;
-  categoryCounters.set(category, currentCount);
-  const token = `[REDACTED_${category}_#${currentCount}]`;
-  secretToToken.set(secret, token);
   return token;
 }
 
-interface SecretCategoryRule {
-  category: string;
-  regex: RegExp;
-  extractSecret?: (match: RegExpExecArray) => string;
-}
-
-const CATEGORY_RULES: SecretCategoryRule[] = [
+// Each rule captures the secret in group 1. Specific rules run before SECRET.
+const RULES: { category: string; rx: RegExp }[] = [
+  { category: "PRIVATE_KEY", rx: /(-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)/g },
+  { category: "AWS_KEY", rx: /\b((?:AKIA|ASIA)[0-9A-Z]{16})\b/g },
+  { category: "GITHUB_TOKEN", rx: /\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})(?![\w])/g },
+  { category: "SLACK_TOKEN", rx: /\b(xox[baprs]-[0-9a-zA-Z-]{10,48})\b/g },
+  { category: "API_KEY", rx: /\b(sk-ant-[\w-]{20,}|sk-proj-[\w-]{20,}|sk-[A-Za-z0-9]{32,}|AIza[\w-]{35}|[rs]k_live_[0-9A-Za-z]{24,})(?![\w-])/g },
+  { category: "URL_CREDENTIAL", rx: /:\/\/[^\s:/@]+:([^\s@/]+)@/g },
   {
-    category: "AWS_KEY",
-    regex: /\b(AKIA[0-9A-Z]{16})\b/g,
-    extractSecret: (m) => m[1],
-  },
-  {
-    category: "GITHUB_TOKEN",
-    regex: /\b(gh[pousr]_[A-Za-z0-9_]{36,255})\b/g,
-    extractSecret: (m) => m[1],
-  },
-  {
-    category: "PRIVATE_KEY",
-    regex: /(-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)/g,
-    extractSecret: (m) => m[1],
-  },
-  {
-    category: "SLACK_TOKEN",
-    regex: /\b(xox[baprs]-[0-9a-zA-Z]{10,48})\b/g,
-    extractSecret: (m) => m[1],
-  },
-  {
-    category: "OPENAI_KEY",
-    regex: /\b(sk-[a-zA-Z0-9]{20,T3BlbkFJ[a-zA-Z0-9]{20,})\b|\b(sk-proj-[a-zA-Z0-9_\-]{40,})\b/g,
-    extractSecret: (m) => m[1] || m[2] || m[0],
-  },
-  {
-    category: "STRIPE_KEY",
-    regex: /\b([rs]k_live_[0-9a-zA-Z]{24,})\b/g,
-    extractSecret: (m) => m[1],
-  },
-  {
-    category: "ENV_SECRET",
-    regex: /(?:^|[\r\n])\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|AUTH|PRIVATE)[A-Za-z0-9_]*)\s*=\s*(["']?)([^\r\n"']+)\2/gi,
-    extractSecret: (m) => m[3],
-  },
-  {
-    category: "GENERIC_SECRET",
-    regex: /(?:api[_-]?key|secret[_-]?token|auth[_-]?token|bearer[_-]?token)\s*[:=]\s*["']?([A-Za-z0-9\-_./+=]{16,})["']?/gi,
-    extractSecret: (m) => m[1],
+    // NAME=value / NAME: value / "name": "value", where a NAME segment is a secret word.
+    category: "SECRET",
+    rx: /(?:^|[\s;,{("'])(?:export\s+)?(?:[A-Za-z0-9]+[_-])*(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|PASS|AUTH|PRIVATE)(?:[_-][A-Za-z0-9]+)*["']?\s*[=:]\s*(?:"([^"\r\n]{8,})"|'([^'\r\n]{8,})'|([^\s"',;]{8,}))/gi,
   },
 ];
 
 let gitleaksAvailable: boolean | null = null;
-function isGitleaksAvailable(): boolean {
-  if (gitleaksAvailable !== null) return gitleaksAvailable;
-  try {
-    const res = cp.spawnSync("gitleaks", ["version"], { timeout: 500, stdio: "ignore" });
-    gitleaksAvailable = res.status === 0;
-  } catch {
-    gitleaksAvailable = false;
+function hasGitleaks(): boolean {
+  if (gitleaksAvailable === null) {
+    gitleaksAvailable = cp.spawnSync("gitleaks", ["version"], { timeout: 500, stdio: "ignore" }).status === 0;
   }
   return gitleaksAvailable;
 }
 
 export function scanWithGitleaks(text: string, timeoutMs = 500): string[] {
-  if (!isGitleaksAvailable()) return [];
+  if (!hasGitleaks()) return [];
   try {
-    const child = cp.spawnSync("gitleaks", ["detect", "--pipe", "--report-format", "json", "--report-path", "/dev/stdout"], {
-      input: text,
-      timeout: timeoutMs,
-      encoding: "utf-8",
-      maxBuffer: 5 * 1024 * 1024,
-    });
-    // Gitleaks returns exit code 1 when leaks are detected
-    if (child.stdout) {
-      const parsed = JSON.parse(child.stdout);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item: any) => item.Secret || item.Match).filter(Boolean);
-      }
-    }
+    const res = cp.spawnSync(
+      "gitleaks",
+      ["stdin", "--no-banner", "--log-level", "error", "--report-format", "json", "--report-path", "-"],
+      { input: text, timeout: timeoutMs, encoding: "utf-8", maxBuffer: 5 * 1024 * 1024 },
+    );
+    const found = JSON.parse(res.stdout || "[]");
+    return Array.isArray(found) ? found.map((f: { Secret?: string }) => f.Secret ?? "").filter((s: string) => s.length >= 8) : [];
   } catch {
-    // Non-blocking fallback
+    return [];
   }
-  return [];
 }
 
-export function redactSecrets(text: string, config: DlpGuardConfig = DEFAULT_CONFIG): string {
-  if (!text || typeof text !== "string") return text;
-  let result = text;
-
-  // 1. In-process deterministic regex replacement
-  for (const rule of CATEGORY_RULES) {
-    result = result.replace(rule.regex, (...args) => {
-      const match = args[0];
-      const matchArray = [match, ...args.slice(1, -2)] as unknown as RegExpExecArray;
-      const secret = rule.extractSecret ? rule.extractSecret(matchArray) : match;
-      if (!secret || secret.trim().length === 0) return match;
-
-      const token = getRelationalToken(secret, rule.category);
-      return match.replace(secret, token);
+/** Replaces secrets with stable tokens. gitleaks (optional) only runs on large inputs. */
+export function redactSecrets(text: string, config: DlpGuardConfig = DEFAULT_CONFIG, useGitleaks = false): string {
+  if (typeof text !== "string" || !text) return text;
+  let out = text;
+  for (const { category, rx } of RULES) {
+    out = out.replace(rx, (match, ...groups: unknown[]) => {
+      const secret = groups.slice(0, 3).find((g) => typeof g === "string" && g) as string | undefined;
+      if (!secret || /^(?:\[REDACTED_|[$<{(])/.test(secret)) return match;
+      const i = match.lastIndexOf(secret);
+      return match.slice(0, i) + tokenFor(secret, category) + match.slice(i + secret.length);
     });
   }
+  if (useGitleaks && config.enableGitleaks && out.length >= config.gitleaksMinBytes) {
+    for (const secret of scanWithGitleaks(out, config.gitleaksTimeoutMs)) {
+      out = out.split(secret).join(tokenFor(secret, "SECRET"));
+    }
+  }
+  return out;
+}
 
-  // 2. Optional gitleaks pipe on large buffers
-  if (config.enableGitleaks && result.length >= config.gitleaksMinBytes) {
-    const gitleaksSecrets = scanWithGitleaks(result, config.gitleaksTimeoutMs);
-    for (const secret of gitleaksSecrets) {
-      if (secret && secret.length >= 8) {
-        const token = getRelationalToken(secret, "GITLEAKS");
-        result = result.split(secret).join(token);
+// -----------------------------------------------------------------------------
+// Path protection
+// -----------------------------------------------------------------------------
+
+function expandHome(p: string): string {
+  return p.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, HOME);
+}
+
+/** Glob to RegExp: `**` crosses directories, `*` does not; `**\/` may match nothing. */
+function globToRegExp(glob: string): RegExp {
+  let s = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      if (glob[i + 2] === "/") {
+        s += "(?:.*/)?";
+        i += 2;
+      } else {
+        s += ".*";
+        i += 1;
       }
-    }
+    } else if (c === "*") s += "[^/]*";
+    else s += c.replace(/[.+^${}()|[\]\\?]/g, "\\$&");
   }
-
-  return result;
+  return new RegExp(`^${s}$`, "i");
 }
 
-// -----------------------------------------------------------------------------
-// Path Canonicalization & Protection Engine (Mitnick Vector: Traversal & Symlinks)
-// -----------------------------------------------------------------------------
+/** Does an absolute path match a pattern? A bare name matches any basename. */
+function matches(pattern: string, abs: string, cwd: string): boolean {
+  let g = expandHome(pattern.replace(/\\/g, "/"));
+  if (!g.includes("/")) return globToRegExp(g).test(path.basename(abs));
+  if (!g.startsWith("/") && !g.startsWith("**")) g = `${cwd}/${g}`;
+  if (globToRegExp(g).test(abs)) return true;
+  if (g.endsWith("/**") && globToRegExp(g.slice(0, -3)).test(abs)) return true;
 
-function expandTilde(p: string): string {
-  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
-    return path.join(os.homedir(), p.slice(1));
+  // On macOS /var is a symlink to /private/var: check pattern with canonical prefix as well.
+  const prefix = g.replace(/\/\*\*?.*$/, "");
+  const canonPrefix = canonical(prefix);
+  if (canonPrefix !== prefix) {
+    const gCanon = canonPrefix + g.slice(prefix.length);
+    if (globToRegExp(gCanon).test(abs)) return true;
+    if (gCanon.endsWith("/**") && globToRegExp(gCanon.slice(0, -3)).test(abs)) return true;
   }
-  return p;
+  return false;
 }
 
-const INTRINSIC_PROTECTED_PATTERNS = [
-  /(?:^|[\/\\])\.env(?:[\.\-_].*)?$/i,
-  /(?:^|[\/\\])\.git(?:[\/\\]|$)/i,
-  /(?:^|[\/\\])(?:\.ssh|\.aws|\.gnupg|\.netrc)(?:[\/\\]|$)/i,
-  /\.(?:pem|key)$/i,
-  /(?:^|[\/\\])id_(?:rsa|ed25519)(?:[\.\-_].*)?$/i,
-];
-
-function matchGlob(pattern: string, target: string): boolean {
-  const normTarget = target.replace(/\\/g, "/");
-  const normPattern = expandTilde(pattern).replace(/\\/g, "/");
-
-  if (normPattern.includes("*")) {
-    const regexPattern = normPattern
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*/g, "___GLOBSTAR___")
-      .replace(/\*/g, "[^/]*")
-      .replace(/___GLOBSTAR___/g, ".*");
-    const rx = new RegExp(`^${regexPattern}$`, "i");
-    if (rx.test(normTarget)) return true;
-
-    if (!pattern.includes("/")) {
-      const baseRx = new RegExp(`^${normPattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`, "i");
-      if (baseRx.test(normTarget.split("/").pop() || "")) return true;
-    }
+/** Follows symlinks, including dangling ones, and ancestors of files that do not exist yet. */
+function canonical(p: string, depth = 0): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    // not resolvable as-is
   }
-  return normTarget === normPattern || normTarget.startsWith(normPattern + "/");
+  try {
+    if (depth < 8 && fs.lstatSync(p).isSymbolicLink()) return canonical(path.resolve(path.dirname(p), fs.readlinkSync(p)), depth + 1);
+  } catch {
+    // does not exist
+  }
+  const parent = path.dirname(p);
+  return parent === p ? p : path.join(canonical(parent, depth), path.basename(p));
 }
 
 export function isPathProtected(
   targetPath: string,
   config: DlpGuardConfig = DEFAULT_CONFIG,
   cwd: string = process.cwd(),
-  op: "read" | "write" = "read"
+  op: "read" | "write" = "read",
 ): { protected: boolean; reason?: string } {
-  if (!targetPath || typeof targetPath !== "string") {
-    return { protected: false };
+  if (typeof targetPath !== "string" || !targetPath.trim()) return { protected: false };
+  const lexical = path.resolve(cwd, expandHome(targetPath.trim()));
+  if (TEMPLATE_ENV.test(path.basename(lexical)) && canonical(lexical) === lexical) return { protected: false };
+
+  const integrity = op === "write" ? [...config.integrityPaths, ...(packageDir ? [`${packageDir}/**`] : [])] : [];
+  for (const abs of new Set([lexical, canonical(lexical)])) {
+    const hit = config.protectedPaths.find((p) => matches(p, abs, cwd));
+    if (hit) return { protected: true, reason: `percorso protetto "${hit}"` };
+    const own = integrity.find((p) => matches(p, abs, cwd));
+    if (own) return { protected: true, reason: `integrità del guardiano: scrittura vietata su "${own}"` };
   }
-
-  const rawNormalized = targetPath.trim().replace(/\\/g, "/");
-  const expanded = expandTilde(rawNormalized);
-  const resolved = path.resolve(cwd, expanded);
-
-  // Layer 1: Lexical check on raw string, expanded string, and resolved path
-  for (const pattern of INTRINSIC_PROTECTED_PATTERNS) {
-    if (pattern.test(rawNormalized) || pattern.test(expanded) || pattern.test(resolved)) {
-      return {
-        protected: true,
-        reason: `Percorso riservato intercettato da regola di sicurezza intrinseca (${path.basename(resolved)})`,
-      };
-    }
-  }
-
-  // Check against integrity paths if operation is mutating (write/edit/delete)
-  if (op === "write" && Array.isArray(config.integrityPaths)) {
-    for (const integrityPath of config.integrityPaths) {
-      const intExpanded = expandTilde(integrityPath.replace(/\\/g, "/"));
-      const intResolved = path.resolve(cwd, intExpanded);
-
-      if (
-        resolved === intResolved ||
-        resolved.startsWith(intResolved + path.sep) ||
-        matchGlob(integrityPath, resolved) ||
-        matchGlob(integrityPath, rawNormalized)
-      ) {
-        return {
-          protected: true,
-          reason: `Integrità del Guardiano: mutazione o cancellazione bloccata su "${integrityPath}" (Regola: Controllore != Controllato)`,
-        };
-      }
-    }
-  }
-
-  // Check against configured protected paths (blocked for both read and write)
-  const homeDir = os.homedir();
-  for (const configured of config.protectedPaths) {
-    const cfgExpanded = expandTilde(configured.replace(/\\/g, "/"));
-    const cfgResolved = path.resolve(cwd, cfgExpanded);
-
-    // Exact, prefix, or glob match
-    if (
-      resolved === cfgResolved ||
-      resolved.startsWith(cfgResolved + path.sep) ||
-      matchGlob(configured, resolved) ||
-      matchGlob(configured, rawNormalized)
-    ) {
-      return {
-        protected: true,
-        reason: `Percorso protetto configurato in dlp-guard.json: "${configured}"`,
-      };
-    }
-
-    // Basename / wildcards match
-    const base = path.basename(resolved);
-    if (configured.startsWith(".env") && base.startsWith(".env")) {
-      return {
-        protected: true,
-        reason: `File d'ambiente protetto: "${base}"`,
-      };
-    }
-  }
-
-  // Layer 2: Canonical realpath check (Mitnick traversal & symlink defense)
-  try {
-    if (fs.existsSync(resolved)) {
-      const canonical = fs.realpathSync(resolved);
-      const canonicalNorm = canonical.replace(/\\/g, "/");
-
-      // Check if canonical target lands inside ~/.ssh, ~/.aws, .git, or matches .env
-      const canonicalHome = homeDir.replace(/\\/g, "/");
-      if (
-        canonicalNorm.startsWith(canonicalHome + "/.ssh") ||
-        canonicalNorm.startsWith(canonicalHome + "/.aws") ||
-        canonicalNorm.startsWith(canonicalHome + "/.gnupg") ||
-        /(?:^|[\/\\])\.env(?:[\.\-_].*)?$/i.test(canonicalNorm) ||
-        /(?:^|[\/\\])\.git(?:[\/\\]|$)/i.test(canonicalNorm) ||
-        /\.(?:pem|key)$/i.test(canonicalNorm)
-      ) {
-        return {
-          protected: true,
-          reason: `Risoluzione symlink/canonica punta a un percorso protetto (${canonical})`,
-        };
-      }
-
-      // Check integrity on canonical path for write ops
-      if (op === "write" && Array.isArray(config.integrityPaths)) {
-        for (const integrityPath of config.integrityPaths) {
-          if (matchGlob(integrityPath, canonicalNorm)) {
-            return {
-              protected: true,
-              reason: `Risoluzione symlink/canonica punta a percorso di integrità protetto (${canonical})`,
-            };
-          }
-        }
-      }
-    }
-  } catch {
-    // If realpath resolution fails, lexical check already guarded the operation
-  }
-
   return { protected: false };
 }
 
 // -----------------------------------------------------------------------------
-// Bash Lexer & Redirection Inspection Guard
+// Bash analysis: split chained commands, track `cd`, check write targets
 // -----------------------------------------------------------------------------
+
+type Segment = { words: string[]; redirects: string[] };
+
+/** Splits on ; && || | & and newlines outside quotes. Redirect targets are collected apart. */
+function parseSegments(cmd: string): Segment[] {
+  const segments: Segment[] = [];
+  let seg: Segment = { words: [], redirects: [] };
+  let word = "";
+  let inWord = false;
+  let quote = "";
+  let redirect = false; // the next word is a write redirect target
+
+  const endWord = () => {
+    if (inWord) (redirect ? seg.redirects : seg.words).push(word);
+    if (inWord) redirect = false;
+    word = "";
+    inWord = false;
+  };
+  const endSegment = () => {
+    endWord();
+    redirect = false;
+    if (seg.words.length || seg.redirects.length) segments.push(seg);
+    seg = { words: [], redirects: [] };
+  };
+
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      if (c === quote) quote = "";
+      else if (c === "\\" && quote === '"' && i + 1 < cmd.length) word += cmd[++i];
+      else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      inWord = true;
+    } else if (c === "\\" && i + 1 < cmd.length) {
+      word += cmd[++i];
+      inWord = true;
+    } else if (c === ";" || c === "\n" || c === "|") {
+      endSegment();
+    } else if (c === "&" && cmd[i - 1] !== ">" && cmd[i + 1] !== ">") {
+      endSegment();
+    } else if (c === ">") {
+      endWord();
+      if (cmd[i + 1] === ">") i++;
+      redirect = true;
+    } else if (c === "<") {
+      endWord(); // input redirection is a read: not checked here
+      if (cmd[i + 1] === "<") i++;
+    } else if (/\s/.test(c)) {
+      endWord();
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  endSegment();
+  return segments;
+}
+
+const WRAPPERS = new Set(["sudo", "env", "command", "nohup", "time", "exec", "nice", "builtin", "xargs"]);
+const MUTATORS = new Set(["rm", "rmdir", "mv", "cp", "ln", "install", "rsync", "touch", "truncate", "dd", "chmod", "chown", "chgrp", "tee", "shred", "unlink", "mkdir", "patch"]);
+const IN_PLACE_EDITORS = new Set(["sed", "perl", "ruby"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 
 export function checkBashCommand(
   cmd: string,
   config: DlpGuardConfig = DEFAULT_CONFIG,
-  cwd: string = process.cwd()
+  cwd: string = process.cwd(),
+  depth = 0,
 ): { block: boolean; reason?: string } {
-  if (!cmd || typeof cmd !== "string") {
-    return { block: false };
-  }
+  if (typeof cmd !== "string" || !cmd.trim() || depth > 3) return { block: false };
+  const deny = (target: string, reason?: string) => ({ block: true, reason: `scrittura vietata su "${target}" (${reason})` });
+  let here = cwd;
 
-  const trimmed = cmd.trim();
+  // Nested code: $(...), `...`, sh -c "...", eval "..."
+  const nested = [...cmd.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)].map((m) => m[1] ?? m[2]);
 
-  // 1. Redirection inspection: < file, > file, >> file, | tee file
-  const redirectionRegex = /(<|>|>>|\|\s*tee\s+(?:-a\s+)?)\s*([^\s;&|]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = redirectionRegex.exec(trimmed)) !== null) {
-    const operator = match[1].trim();
-    const rawTarget = match[2].replace(/["']/g, "");
-    const op = operator === "<" ? "read" : "write";
-    const check = isPathProtected(rawTarget, config, cwd, op);
-    if (check.protected) {
-      return {
-        block: true,
-        reason: `Redirezione shell non consentita verso percorso protetto: ${rawTarget} (${check.reason})`,
-      };
+  for (const { words, redirects } of parseSegments(cmd)) {
+    let i = 0;
+    while (i < words.length && (/^[A-Za-z_]\w*=/.test(words[i]) || WRAPPERS.has(path.basename(words[i])))) i++;
+    const name = path.basename(words[i] ?? "");
+    const args = words.slice(i + 1);
+
+    if (name === "cd" || name === "pushd") {
+      if (args[0]) here = path.resolve(here, expandHome(args[0]));
+      continue;
+    }
+    if (SHELLS.has(name) && args.includes("-c")) nested.push(args[args.indexOf("-c") + 1] ?? "");
+    if (name === "eval") nested.push(args.join(" "));
+
+    const inPlace = IN_PLACE_EDITORS.has(name) && args.some((a) => /^-[A-Za-z]*i|^--in-place/.test(a));
+    const targets = MUTATORS.has(name) || inPlace ? [...args.filter((a) => !a.startsWith("-")), ...redirects] : redirects;
+    for (const target of targets) {
+      const check = isPathProtected(target, config, here, "write");
+      if (check.protected) return deny(target, check.reason);
     }
   }
 
-  // 2. Token / Argument inspection: split on whitespace ignoring quoted regions
-  const isMutatingCommand = /^(?:rm|mv|sed\s+.*-i|truncate|dd|touch)\b/i.test(trimmed);
-  const defaultOp = isMutatingCommand ? "write" : "read";
-  const tokens = trimmed.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-  for (const token of tokens) {
-    const cleanToken = token.replace(/^["']|["']$/g, "");
-    if (!cleanToken || cleanToken.startsWith("-")) continue;
-
-    // Direct check against all protected patterns
-    const check = isPathProtected(cleanToken, config, cwd, defaultOp);
-    if (check.protected) {
-      return {
-        block: true,
-        reason: `Comando shell bloccato: argomento "${cleanToken}" punta a percorso protetto (${check.reason})`,
-      };
-    }
+  for (const inner of nested) {
+    const res = checkBashCommand(inner, config, here, depth + 1);
+    if (res.block) return res;
   }
-
-  // 3. Staged diff pre-commit scan
-  if (/\bgit\s+commit\b/i.test(trimmed)) {
-    try {
-      const stagedDiff = cp.execSync("git diff --cached", {
-        cwd,
-        encoding: "utf-8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-
-      if (stagedDiff) {
-        // Run regex checks
-        const hasSecret = CATEGORY_RULES.some((rule) => {
-          rule.regex.lastIndex = 0;
-          return rule.regex.test(stagedDiff);
-        });
-
-        if (hasSecret) {
-          return {
-            block: true,
-            reason: "🔒 [DLP Alert] Commit bloccato: rilevata una chiave o token segreto nei file in staging. 👉 Rimuovi il file con 'git reset <file>' prima di committare.",
-          };
-        }
-
-        // Run gitleaks if enabled
-        if (config.enableGitleaks && isGitleaksAvailable()) {
-          const leaks = scanWithGitleaks(stagedDiff, config.gitleaksTimeoutMs);
-          if (leaks.length > 0) {
-            return {
-              block: true,
-              reason: `🔒 [DLP Alert] Gitleaks ha rilevato ${leaks.length} credenziali o token nei file in staging. Commit rifiutato.`,
-            };
-          }
-        }
-      }
-    } catch {
-      // Non-blocking if git diff fails (e.g. not a git repo)
-    }
-  }
-
   return { block: false };
 }
 
 // -----------------------------------------------------------------------------
-// Extension Main Entrypoint
+// Extension entry point
 // -----------------------------------------------------------------------------
+
+const PATH_KEYS = ["path", "file", "file_path", "filePath", "notebook_path", "paths"];
+const WRITE_TOOL = /write|edit|replace|patch|create|delete|move|rename/i;
+
+function pathsOf(input: Record<string, unknown>): string[] {
+  return PATH_KEYS.flatMap((k) => (Array.isArray(input[k]) ? (input[k] as unknown[]) : [input[k]])).filter((v): v is string => typeof v === "string");
+}
+
+type Part = { type?: string; text?: string };
+
+function redactParts(content: unknown, redact: (s: string) => string): unknown {
+  if (typeof content === "string") return redact(content);
+  if (!Array.isArray(content)) return content;
+  return content.map((p: Part) => (p?.type === "text" && typeof p.text === "string" ? { ...p, text: redact(p.text) } : p));
+}
 
 export default function (pi: ExtensionAPI) {
   let config = loadConfig();
-  let isEnabled = true;
+  let enabled = true;
 
-  // 1. Tool Call Guard: Read/Write/Edit & Bash
   pi.on("tool_call", async (event, ctx) => {
-    if (!isEnabled) return undefined;
-    const toolName = event.toolName;
+    if (!enabled) return undefined;
     const input = (event.input || {}) as Record<string, unknown>;
+    let reason: string | undefined;
 
-    // Intercept File Operations (read, write, edit)
-    if (toolName === "read" || toolName === "write" || toolName === "edit") {
-      const targetPath = String(input.path || input.file || "");
-      const op = toolName === "read" ? "read" : "write";
-      const check = isPathProtected(targetPath, config, process.cwd(), op);
-      if (check.protected) {
-        if (ctx.hasUI) {
-          ctx.ui.notify(`🛑 [DLP Guard] Bloccato accesso al percorso: ${targetPath}`, "error");
+    if (event.toolName === "bash") {
+      if (typeof input.command === "string") reason = checkBashCommand(input.command, config, process.cwd()).reason;
+    } else {
+      const op = WRITE_TOOL.test(event.toolName) ? "write" : "read";
+      for (const target of pathsOf(input)) {
+        const check = isPathProtected(target, config, process.cwd(), op);
+        if (check.protected) {
+          reason = `${target}: ${check.reason}`;
+          break;
         }
-        return {
-          block: true,
-          reason: `🛑 [DLP Guard] Operazione non consentita su percorso protetto: ${targetPath}. ${check.reason}`,
-        };
       }
     }
-
-    // Intercept Bash Shell Commands
-    if (toolName === "bash" && typeof input.command === "string") {
-      const check = checkBashCommand(input.command, config, process.cwd());
-      if (check.block) {
-        if (ctx.hasUI) {
-          ctx.ui.notify(`🛑 [DLP Guard] Comando shell bloccato: ${check.reason}`, "error");
-        }
-        return {
-          block: true,
-          reason: `🛑 [DLP Guard] ${check.reason}`,
-        };
-      }
-    }
-
-    return undefined;
+    if (!reason) return undefined;
+    if (ctx.hasUI) ctx.ui.notify(`🛑 [DLP Guard] ${reason}`, "error");
+    return { block: true, reason: `🛑 [DLP Guard] ${reason}` };
   });
 
-  // 2. Dual Horizon - Horizon 1: Immediate Transcript & Tool Output Sanitization
+  // Tool output: regex + optional gitleaks on large payloads.
   pi.on("tool_result", async (event) => {
-    if (!isEnabled || !Array.isArray(event.content)) return undefined;
-
-    let modified = false;
-    const sanitizedContent = event.content.map((part) => {
-      if (part.type === "text" && typeof part.text === "string") {
-        const redacted = redactSecrets(part.text, config);
-        if (redacted !== part.text) {
-          modified = true;
-          return { ...part, text: redacted };
-        }
-      }
-      return part;
-    });
-
-    if (modified) {
-      return { content: sanitizedContent };
-    }
-    return undefined;
+    if (!enabled || !Array.isArray(event.content)) return undefined;
+    const content = redactParts(event.content, (s) => redactSecrets(s, config, true));
+    return JSON.stringify(content) === JSON.stringify(event.content) ? undefined : { content: content as typeof event.content };
   });
 
-  // 3. Dual Horizon - Horizon 2: Outbound Context / Wire Sanitization
+  // Outbound messages: regex only, so every turn stays fast.
   pi.on("context", async (event) => {
-    if (!isEnabled || !Array.isArray(event.messages)) return undefined;
-
-    let modified = false;
-    const sanitizedMessages = event.messages.map((msg) => {
-      if (typeof msg.content === "string") {
-        const redacted = redactSecrets(msg.content, config);
-        if (redacted !== msg.content) {
-          modified = true;
-          return { ...msg, content: redacted };
-        }
-      } else if (Array.isArray(msg.content)) {
-        let partsModified = false;
-        const newParts = msg.content.map((part) => {
-          if (part.type === "text" && typeof part.text === "string") {
-            const redacted = redactSecrets(part.text, config);
-            if (redacted !== part.text) {
-              partsModified = true;
-              return { ...part, text: redacted };
-            }
-          }
-          return part;
-        });
-        if (partsModified) {
-          modified = true;
-          return { ...msg, content: newParts };
-        }
-      }
-      return msg;
+    if (!enabled || !Array.isArray(event.messages)) return undefined;
+    let changed = false;
+    const messages = event.messages.map((m) => {
+      const content = redactParts((m as { content?: unknown }).content, (s) => redactSecrets(s, config));
+      if (JSON.stringify(content) === JSON.stringify((m as { content?: unknown }).content)) return m;
+      changed = true;
+      return { ...m, content };
     });
-
-    if (modified) {
-      return { messages: sanitizedMessages };
-    }
-    return undefined;
+    return changed ? { messages: messages as typeof event.messages } : undefined;
   });
 
-  // 4. Interactive Command: /dlp
   pi.registerCommand("dlp", {
-    description: "Gestisci la protezione DLP (/dlp on | off | reload | status)",
+    description: "DLP guard: /dlp [status|on|off|reload]",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
-      if (arg === "off" || arg === "disable") {
-        isEnabled = false;
-        ctx.ui.notify("⚠️ [DLP Guard] Protezione DLP DISATTIVATA temporaneamente per questa sessione.", "warning");
+      if (arg === "off") enabled = false;
+      else if (arg === "on") enabled = true;
+      else if (arg === "reload") config = loadConfig();
+      if (arg === "off" || arg === "on" || arg === "reload") {
+        ctx.ui.notify(`[DLP Guard] ${arg === "reload" ? "configurazione ricaricata" : enabled ? "ATTIVO" : "DISATTIVATO"}`, enabled ? "info" : "warning");
         return;
       }
-      if (arg === "on" || arg === "enable") {
-        isEnabled = true;
-        ctx.ui.notify("🛡️ [DLP Guard] Protezione DLP ATTIVATA.", "info");
-        return;
-      }
-      if (arg === "reload") {
-        config = loadConfig();
-        ctx.ui.notify("🔄 [DLP Guard] Configurazione ricaricata da dlp-guard.json.", "info");
-        return;
-      }
-
-      config = loadConfig();
-      const status = [
-        "🛡️ **pi-dlp-guard Status**:",
-        `- Stato protezione: ${isEnabled ? "✅ ATTIVA" : "⚠️ DISATTIVATA"}`,
-        `- Gitleaks integration: ${config.enableGitleaks ? (isGitleaksAvailable() ? "✅ Attivo" : "⚠️ Non trovato nel PATH") : "Disabilitato"}`,
-        `- Segreti tracciati in sessione: ${secretToToken.size}`,
-        `- Percorsi protetti (${config.protectedPaths.length}):`,
-        ...config.protectedPaths.slice(0, 10).map((p) => `  • ${p}`),
-        config.protectedPaths.length > 10 ? `  ... altri ${config.protectedPaths.length - 10} percorsi` : "",
-        "",
-        "💡 Comandi disponibili: /dlp on | /dlp off | /dlp reload | /dlp status",
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      ctx.ui.notify(status, "info");
+      ctx.ui.notify(
+        [
+          `[DLP Guard] ${enabled ? "ATTIVO" : "DISATTIVATO"}`,
+          `gitleaks: ${config.enableGitleaks ? (hasGitleaks() ? "attivo" : "non trovato nel PATH") : "disabilitato"}`,
+          `segreti mascherati in sessione: ${secretToToken.size}`,
+          `percorsi protetti: ${config.protectedPaths.length}, di integrità: ${config.integrityPaths.length}`,
+        ].join("\n"),
+        "info",
+      );
     },
   });
 }
