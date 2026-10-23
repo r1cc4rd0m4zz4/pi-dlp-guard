@@ -317,7 +317,15 @@ export function detectSecrets(
 
 export function redactSecrets(text: string, config: DlpGuardConfig = DEFAULT_CONFIG, useGitleaks = false): string {
   if (typeof text !== "string" || !text) return text;
-  let out = text;
+  const replaceKnown = (s: string) => {
+    if (!secretToToken.size) return s;
+    let res = s;
+    for (const sec of [...secretToToken.keys()].sort((a, b) => b.length - a.length)) {
+      if (res.includes(sec)) res = res.split(sec).join(secretToToken.get(sec)!);
+    }
+    return res;
+  };
+  let out = replaceKnown(text);
   for (const { category, rx } of RULES) {
     rx.lastIndex = 0;
     out = out.replace(rx, (match, ...groups: unknown[]) => {
@@ -327,6 +335,7 @@ export function redactSecrets(text: string, config: DlpGuardConfig = DEFAULT_CON
       return i === -1 ? match : match.slice(0, i) + tokenFor(secret, category) + match.slice(i + secret.length);
     });
   }
+  out = replaceKnown(out);
   if (useGitleaks && config.enableGitleaks && out.length >= config.gitleaksMinBytes) {
     for (const secret of scanWithGitleaks(out, config.gitleaksTimeoutMs)) {
       if (!isBenign(secret)) out = out.split(secret).join(tokenFor(secret, "SECRET"));
@@ -340,6 +349,7 @@ export function redactSecrets(text: string, config: DlpGuardConfig = DEFAULT_CON
 // -----------------------------------------------------------------------------
 
 const TEMPLATE_ENV = /^\.env\.(?:example|sample|template|dist|default|schema)$/i;
+const ENV_PATTERN = /(?:^|\/|\*)\.env(?:\.\*)?$/i;
 const SAMPLE_SENSITIVE_BASENAMES = [
   ".env",
   ".env.local",
@@ -462,7 +472,9 @@ function checkSinglePath(
   const canon = canonical(lexical);
   const isEnvTemplate = TEMPLATE_ENV.test(path.basename(lexical)) && TEMPLATE_ENV.test(path.basename(canon));
 
-  const protectedList = isEnvTemplate ? [] : config.protectedPaths;
+  const protectedList = isEnvTemplate
+    ? config.protectedPaths.filter((p) => !ENV_PATTERN.test(p.replace(/\\/g, "/")))
+    : config.protectedPaths;
   const integrityList =
     op === "write" ? [...config.integrityPaths, ...(packageDir ? [`${packageDir}/**`] : [])] : [];
 
@@ -582,6 +594,11 @@ function parseSegments(cmd: string): Segment[] {
 
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
+    if (!quote && (cmd.startsWith("$IFS", i) || cmd.startsWith("${IFS}", i))) {
+      endWord();
+      i += cmd[i + 1] === "{" ? 5 : 3;
+      continue;
+    }
     if (quote) {
       if (c === quote) {
         if (ansiC) {
@@ -1039,16 +1056,24 @@ export function checkBashCommand(
       }
     }
 
-    if (cmdName === "git" && config.blockReaderCommandsOnProtected) {
+    if (cmdName === "git") {
+      const sub = args[0];
+      const isGitMutator = sub === "checkout" || sub === "restore" || sub === "clean";
       for (let j = 0; j < args.length; j++) {
         const a = args[j];
         let cand: string | null = null;
         if (a.startsWith("--file=")) cand = a.slice(7);
-        else if ((a === "-f" || a === "--file") && args[0] === "config" && args[j + 1]) cand = args[++j];
-        else if (!a.startsWith("-") && j > 0) cand = a.includes(":") && !a.includes("://") ? (a.split(":").pop() ?? a) : a;
+        else if ((a === "-f" || a === "--file") && sub === "config" && args[j + 1]) cand = args[++j];
+        else if (!a.startsWith("-") && a !== "--" && j > 0) cand = a.includes(":") && !a.includes("://") ? (a.split(":").pop() ?? a) : a;
         if (cand) {
-          const hit = checkTarget(cand, "read", "accesso git a percorso protetto");
-          if (hit) return hit;
+          if (isGitMutator) {
+            const hitW = checkTarget(cand, "write", "modifica git su percorso protetto");
+            if (hitW) return hitW;
+          }
+          if (config.blockReaderCommandsOnProtected) {
+            const hitR = checkTarget(cand, "read", "accesso git a percorso protetto");
+            if (hitR) return hitR;
+          }
         }
       }
     }
@@ -1220,9 +1245,29 @@ const WRITE_TOOL = /write|edit|replace|patch|create|delete|remove|move|rename|up
 const OUTBOUND_TOOL = /search|web|fetch|http|url|curl|request|send|post|mcp/i;
 
 function pathsOf(input: Record<string, unknown>): string[] {
-  return PATH_KEYS.flatMap((k) => (Array.isArray(input[k]) ? (input[k] as unknown[]) : [input[k]]))
+  const raw = PATH_KEYS.flatMap((k) => (Array.isArray(input[k]) ? (input[k] as unknown[]) : [input[k]]))
     .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
-    .map((v) => v.trim());
+    .map((v) => {
+      const s = v.trim();
+      if (s.startsWith("file://")) {
+        try {
+          return fileURLToPath(s);
+        } catch {
+          return s.slice(7);
+        }
+      }
+      return s.includes("://") ? "" : s;
+    })
+    .filter(Boolean);
+
+  const patch = (input.patchText ?? input.patch ?? "") as string;
+  if (typeof patch === "string" && patch) {
+    for (const m of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$|^(?:\+\+\+|---) (?:[ab]\/)?(.+)$/gm)) {
+      const t = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+      if (t && t !== "/dev/null") raw.push(t);
+    }
+  }
+  return raw;
 }
 
 function extractWriteTexts(input: Record<string, unknown>): string {
