@@ -31,6 +31,8 @@
   },
   "files": [
     "extensions/dlp-guard.ts",
+    "AGENTS.md",
+    "dlp-guard.json.example",
     "README.md",
     "LICENSE"
   ]

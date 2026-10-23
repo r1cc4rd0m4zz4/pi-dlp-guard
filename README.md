@@ -9,7 +9,7 @@
 |_|                    |_|          |___/                        
 ```
 
-> **Zero-dependency path protection & secret redaction guard for [Pi Coding Agent](https://github.com/earendil-works/pi).**
+> **Zero-dependency DLP, Path Protection, Deep Shell Obfuscation Guard & Secret Redaction for [Pi Coding Agent](https://github.com/earendil-works/pi).**
 
 [![Pi Package](https://img.shields.io/badge/Pi--Package-Extension-76B900?logo=github&logoColor=white)](https://github.com/r1cc4rd0m4zz4/pi-dlp-guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -25,34 +25,41 @@ pi install git:github.com/r1cc4rd0m4zz4/pi-dlp-guard
 
 ## Modello di Sicurezza
 
-`pi-dlp-guard` agisce come **difesa in profondità a livello di estensione** per ridurre il rischio di esfiltrazione accidentale di credenziali e proteggere l'integrità della configurazione dell'agente.
+`pi-dlp-guard` agisce come **difesa in profondità a livello di estensione** su tutti gli hook del ciclo di vita di Pi (`tool_call`, `tool_result`, `context`) per bloccare preventivamente l'accesso a percorsi sensibili, neutralizzare l'esfiltrazione o la scrittura di segreti in chiaro, impedire la manomissione della configurazione dell'agente e mascherare in modo relazionale qualsiasi credenziale negli output.
 
-> **Nota architetturale**: L'analisi lessicale dei comandi shell non costituisce un confine di sicurezza invalicabile contro un attaccante determinato che usa interpreti secondari, offuscamenti avanzati o chiamate dirette a basso livello. Per un isolamento ermetico dei processi dell'agente, abbina questa estensione a una sandbox a livello di kernel OS (Apple Seatbelt su macOS o Bubblewrap su Linux, es. `mysafe-run`).
+> **Nota architetturale**: L'analisi lessicale dei comandi shell è progettata contro offuscamenti, catene e interpreti inline, ma non sostituisce l'isolamento a livello di kernel. Per un confine ermetico a livello di sistema operativo, abbina questa estensione a una sandbox OS (Apple Seatbelt su macOS o Bubblewrap su Linux).
 
-### Tre Livelli di Difesa
+### Quattro Livelli di Difesa
 
-1. **Protezione dei Percorsi nei Tool Strutturati (`tool_call`)**:
-   - Blocca le operazioni di lettura e scrittura su percorsi sensibili (`.env*`, `~/.ssh/**`, `~/.aws/**`, `~/.gnupg/**`, `~/.zshrc*`, `~/.bashrc*`, `~/.pi/agent/auth.json`, chiavi private `*.pem`, `*.key`).
-   - I template comuni come `.env.example` e `.env.sample` rimangono accessibili.
-   - Riconosce i campi percorso su tutti i tool (non solo `read`/`write`, ma anche `read_symbol`, `ast_grep_search`, tool MCP con `path`/`paths`).
-   - Risoluzione canonica (`realpath`) per neutralizzare directory traversal (`../../`) e symlink (inclusi symlink dangling).
+1. **Protezione Canonica dei Percorsi e Anti-Bypass (`tool_call`)**:
+   - Blocca lettura, scrittura, modifica e cancellazione su oltre **60 pattern sensibili**:
+     - **Segreti Ambiente**: `.env`, `.env.*`, `*.env`, `.envrc` *(consentendo i soli template `.env.example`, `.env.sample`, `.env.template`, `.env.dist`, `.env.schema` non-symlink e fuori dai percorsi di integrità)*.
+     - **Chiavi Crittografiche e Certificati**: `~/.ssh/**`, `/etc/ssh/**`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.pkcs12`, `*.jks`, `*.keystore`, `*.age`, `~/.gnupg/**`.
+     - **Credenziali Cloud, Infra e Package Manager**: `~/.aws/**`, `~/.config/gcloud/**`, `~/.gcp/**`, `~/.azure/**`, `~/.oci/**`, `~/.kube/**`, `~/.docker/config.json`, `*.tfstate*`, `*.tfvars`, `~/.vault-token`, `~/.password-store/**`, `~/.config/op/**`, `~/.config/gh/**`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.pi/agent/auth.json`, `~/.claude/.credentials.json`, `/etc/shadow*`, `/etc/sudoers*`.
+   - **Normalizzazione Anti-Evasione**:
+     - Rilevamento null-byte injection (`\0` e `%00`)
+     - Decodifica URL singola e doppia (`%2e%2e%2f`, `%252e%252e%252f`)
+     - Espansione `~`, `$HOME`, `${HOME}`, `~+`, `$PWD`, `${PWD}`
+     - Espansione ricorsiva di brace shell (`.{env,bak}`, `~/{.ssh,.aws}/id_rsa`)
+     - Espansione wildcard (`.en?`, `.e*`, `[.]env`) sia sul filesystem reale sia sui nomi canonici sensibili
+     - Risoluzione `realpath` di symlink (inclusi symlink dangling e finti `.env.example -> .env`).
 
-2. **Ispezione delle Scritture Shell (`bash`)**:
-   - Analizza la riga di comando scomponendo sequenze e catene (`&&`, `||`, `;`, `|`, `&`, newline).
-   - Traccia i cambi di directory (`cd`, `pushd`) lungo la catena per valutare i percorsi relativi nel contesto corretto.
-   - Blocca comandi mutatori (`rm`, `mv`, `cp`, `ln`, `install`, `rsync`, `touch`, `truncate`, `sed -i`, ecc.) e redirezioni di scrittura (`>`, `>>`, `| tee`) verso percorsi protetti o file di integrità dell'agente.
-   - Le letture passive e le ricerche nel codice (es. `grep -rn "\.env" src/`) non vengono bloccate, delegando la protezione dell'output al livello di mascheramento.
+2. **Ispezione Profonda Shell & Motore Anti-Offuscamento (`bash` / `run_command`)**:
+   - Scompone catene e subshell (`&&`, `||`, `;`, `|`, `&`, newline, `( ... )`, `{ ...; }`, `<(...)`, `>(...)`, `$(...)` bilanciati, `` `...` ``, `sh -c`, `eval`).
+   - Traccia i cambi di directory (`cd`, `pushd`) e le assegnazioni di variabili cross-segmento (`A=.e; B=nv; cat $A$B`, `export TARGET=...`).
+   - Decodifica stringhe ANSI-C (`$'\x2e\x65\x6e\x76'`, `$'\056env'`), quote splitting (`.e''nv`), sostituzioni comando (`$(echo .env)`, `$(printf '%s' .env)`) ed espansioni parametro (`.${empty}env`, `${unset:-.env}`).
+   - Scompatta wrapper con argomenti (`sudo -u root`, `env -i`, `timeout 5`, `nice -n 10`, `nohup`, `command`, `xargs`), traccia pipeline `echo .env | xargs ...` e blocca l'esecuzione di payload codificati (`base64 -d | sh`, `xxd -r | bash`).
+   - Blocca **scritture e mutazioni** (`rm`, `mv`, `cp`, `ln`, `rsync`, `truncate`, `chmod`, `chown`, `tee`, `dd of=`, `find -delete`, `sed -i`, redirezioni `>`, `>>`, `>|`, `&>`, `<>`), **letture dirette o indirette** (`cat`, `head`, `tail`, `base64`, `xxd`, `source`, `.`, `grep`, `rg`, `sed`, `awk`, `jq`, `find`, `git show HEAD:.env`, `git diff --no-index`, `tar`, `zip`, `dd if=`, `openssl`, `< .env`), **esfiltrazioni di rete** (`curl -d @.env`, `wget --post-file`, `scp`, `sftp`) e **one-liner di interpreti** (`python -c`, `node -e`, `ruby -e`, `perl -e`).
 
-3. **Integrità del Guardiano (Anti-Tampering)**:
-   - I file di configurazione (`~/.pi/agent/**`) e la cartella stessa del pacchetto `pi-dlp-guard` sono protetti in scrittura/cancellazione dall'agente.
-   - La lettura della configurazione è consentita per il normale funzionamento di Pi, ma la mutazione è riservata all'operatore umano.
+3. **Integrità del Guardiano & Prevenzione Leak Outbound (`tool_call`)**:
+   - **Anti-Tampering**: protegge in scrittura `~/.pi/agent/**`, `.pi/**`, `~/.gemini/**`, `.agents/**`, `**/dlp-guard.json` e la directory stessa di `pi-dlp-guard`. Blocca in `bash` i comandi di disattivazione/rimozione (`pi uninstall pi-dlp-guard`, `agy-dlp toggle off`).
+   - **Zero-Trust sulle Configurazioni Workspace**: i file `.pi/dlp-guard.json` o `.agents/dlp-guard.json` presenti in un repository possono solo *aggiungere* percorsi protetti, mai disattivare il guardiano (`enabled: false`) né rimuovere le protezioni predefinite.
+   - **Prevenzione Segreti in Scrittura ed Esfiltrazione**: blocca `write`/`edit`/`replace`/`patch` se il nuovo testo introdotto contiene segreti in chiaro, blocca i comandi `bash` con credenziali inline, e blocca query esterne (`search_web`, `fetch`, `mcp:*`) contenenti segreti.
 
-4. **Mascheramento Deterministico dei Segreti (`tool_result` & `context`)**:
-   - Sostituzione irreversibile dei segreti con token stabili: `[REDACTED_AWS_KEY_#1]`, `[REDACTED_GITHUB_TOKEN_#1]`, `[REDACTED_API_KEY_#1]`, `[REDACTED_PRIVATE_KEY_#1]`, `[REDACTED_SECRET_#1]`.
-   - **Preservazione Relazionale**: la stessa credenziale riceve sempre lo stesso identificatore durante la sessione, permettendo al modello di comprenderne le relazioni logiche senza accedere al valore in chiaro.
-   - **Idempotenza**: i segnaposto già mascherati non vengono ri-mascherati.
-   - **Zero Latency Wire**: nell'hook `context` (inviato prima di ogni chiamata LLM) l'analisi opera esclusivamente tramite regex native (< 2ms per messaggi di grandi dimensioni), evitando ritardi nei turni di conversazione.
-   - **Supporto Gitleaks**: sui buffer di output dei comandi (`tool_result`) superiori alla soglia configurata (default 4KB), può intervenire `gitleaks stdin` come rete di sicurezza aggiuntiva per pattern non catalogati.
+4. **Mascheramento Deterministico Relazionale (`tool_result` & `context`)**:
+   - **13 Categorie Regex Native ad Alta Precisione** (oltre 30 formati: `PRIVATE_KEY`, `AGE_SECRET_KEY`, `AWS_KEY`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `SLACK_TOKEN`, `NPM_TOKEN`, `PYPI_TOKEN`, `API_KEY` per Anthropic/OpenAI/Google/Stripe/HuggingFace/SendGrid/DigitalOcean, `JWT_TOKEN`, `BEARER_TOKEN`, `URL_CREDENTIAL`, e assegnazioni generiche `SECRET`/`KEY`/`TOKEN`/`PASSWORD`/`PW`/`CREDENTIAL` con filtro anti-falsi positivi sul codice JS/TS).
+   - **Preservazione Relazionale e Idempotenza**: la stessa credenziale riceve sempre lo stesso token `[REDACTED_<CATEGORY>_#N]` nella sessione.
+   - **Rete di Sicurezza Gitleaks**: sui risultati `tool_result` ≥ `gitleaksMinBytes` (default 4KB) interviene anche `gitleaks stdin` se installato nel `PATH`, mentre `context` usa solo regex native (< 2ms) per latenza zero ad ogni turno LLM.
 
 ---
 
@@ -63,41 +70,25 @@ pi install git:github.com/r1cc4rd0m4zz4/pi-dlp-guard
 | `/dlp` o `/dlp status` | Mostra lo stato corrente (ATTIVO/DISATTIVATO), disponibilità di Gitleaks, numero di segreti mascherati in sessione e percorsi protetti |
 | `/dlp off` | Disattiva temporaneamente i controlli per la sessione corrente |
 | `/dlp on` | Riattiva i controlli DLP |
-| `/dlp reload` | Ricarica la configurazione da `~/.pi/agent/dlp-guard.json` senza riavviare la sessione |
+| `/dlp reload` | Ricarica la configurazione da `dlp-guard.json` senza riavviare la sessione |
 
 ---
 
 ## Configurazione (`~/.pi/agent/dlp-guard.json`)
 
-Il file viene creato automaticamente al primo avvio se assente ed è completamente personalizzabile:
+Vedi [`dlp-guard.json.example`](./dlp-guard.json.example) per l'elenco completo delle opzioni:
 
 ```json
 {
-  "protectedPaths": [
-    ".env",
-    ".env.*",
-    "**/.git/**",
-    "~/.ssh/**",
-    "~/.aws/**",
-    "~/.gnupg/**",
-    "~/.netrc",
-    "~/.zshrc*",
-    "~/.bashrc*",
-    "~/.bash_profile",
-    "~/.profile",
-    "**/*rc.local",
-    "**/*.pem",
-    "**/*.key",
-    "**/id_rsa*",
-    "**/id_ed25519*",
-    "~/.pi/agent/auth.json"
-  ],
-  "integrityPaths": [
-    "~/.pi/agent/**"
-  ],
+  "enabled": true,
+  "protectedPaths": [".env", ".env.*", "*.env", "~/.ssh/**", "~/.aws/**"],
+  "integrityPaths": ["~/.pi/agent/**", ".pi/**", ".agents/**", "**/dlp-guard.json"],
   "enableGitleaks": true,
   "gitleaksMinBytes": 4096,
-  "gitleaksTimeoutMs": 500
+  "gitleaksTimeoutMs": 500,
+  "blockInlineSecretsInCommands": true,
+  "blockReaderCommandsOnProtected": true,
+  "blockWriteSecrets": true
 }
 ```
 
@@ -105,55 +96,15 @@ Il file viene creato automaticamente al primo avvio se assente ed è completamen
 
 ## Verifica e Test (`npm test`)
 
-La suite di regressione copre **28 asserzioni** eseguibili in modo isolato (usando directory temporanee):
+La suite avversariale verifica **37 gruppi di test (oltre 150 asserzioni)** in completo isolamento:
 
 ```bash
 npm test
 ```
 
-```text
-path guard
-  ok   .env variants are protected, templates are not
-  ok   credentials, keys and shell rc files
-  ok   benign files are not protected
-  ok   cwd-relative patterns only match under cwd
-  ok   symlink to a built-in protected file
-  ok   symlink to a configured protected file
-  ok   dangling symlink into an integrity path is blocked for write
-  ok   integrity paths: read allowed, write blocked
-  ok   the package's own directory is write-protected
-bash guard
-  ok   redirects and tee to protected paths
-  ok   mutating commands, including ones missing from the first version
-  ok   chained and sequential commands
-  ok   cd is tracked across a chain
-  ok   nested code: sh -c, eval, $(), backticks
-  ok   quote splitting does not hide the target
-  ok   reads, searches and ordinary commands pass
-redaction
-  ok   known token formats
-  ok   NAME=value forms, including bare PASSWORD/TOKEN/SECRET and JSON
-  ok   the same secret keeps the same token, different secrets differ
-  ok   redaction is idempotent: placeholders are never re-redacted
-  ok   no false positives
-gitleaks
-  ok   safety net catches formats the regexes do not know (large buffers only)
-  ok   regexes keep working when gitleaks is disabled
-extension hooks
-  ok   tool_call blocks structured tools by path and operation
-  ok   tool_call blocks chained bash and lets normal bash through
-  ok   tool_result redacts text parts and leaves clean output untouched
-  ok   context redacts string and array content, returns undefined when clean
-  ok   /dlp off disables every hook, /dlp on restores them
-
-28 passed, 0 failed
-```
-
 ---
 
 ## Installazione Locale
-
-Per collegare il repository locale nel proprio ambiente Pi:
 
 ```bash
 pi install /path/to/pi-dlp-guard
@@ -163,4 +114,4 @@ pi install /path/to/pi-dlp-guard
 
 ## License
 
-MIT © 2026
+MIT © 2026 [r1cc4rd0m4zz4](https://github.com/r1cc4rd0m4zz4)
